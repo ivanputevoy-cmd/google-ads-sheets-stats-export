@@ -18,6 +18,9 @@
  *
  * Новые кампании, группы, объявления и ключи подхватываются автоматически.
  *
+ * Дополнительно (необязательно): актуальная сводка (итог по аккаунту + все активные
+ * кампании) может отправляться в Airtable для CRM команды — см. настройки AIRTABLE_*.
+ *
  * Куда вставлять: кабинет Google Ads → Инструменты и настройки →
  *   Массовые действия → Скрипты → «+» → вставить код → Авторизовать →
  *   Просмотр → расписание «Ежечасно». «Время скана» — всегда по Москве.
@@ -54,6 +57,13 @@ var FILE_PREFIX = 'Google Ads — '; // имя создаваемых файло
 var DRIVE_FOLDER_ID = '';          // пусто = корень Google Диска; ID папки = складывать туда
 var SHARE_PUBLIC_EDIT = true;      // true = новые файлы сразу открыты на редактирование всем по ссылке
 var TOP_N = 10;                    // сколько кампаний показывать в «Сводке»
+
+// ── Airtable (необязательно; оставь плейсхолдеры — и отправка выключена) ──
+// Раз в скан в Airtable отправляются итог по аккаунту и все активные кампании
+// (обновлением существующих записей, без дублей). История остаётся в Google Sheets.
+var AIRTABLE_TOKEN = 'PASTE_YOUR_AIRTABLE_TOKEN_HERE';     // Personal Access Token, право data.records:write
+var AIRTABLE_BASE_ID = 'PASTE_YOUR_AIRTABLE_BASE_ID_HERE'; // ID базы (начинается с «app...»)
+var AIRTABLE_TABLE = 'Google Ads';                         // название таблицы в Airtable
 
 var EVERY_N_HOURS = 4;
 var TIMEZONE = 'Europe/Moscow';
@@ -103,6 +113,9 @@ function main() {
   keywords.autoResizeColumns(1, 4);
 
   writeSummary(ss, stamp, cur, tree);
+
+  // Отправка в Airtable не должна ронять основную выгрузку — поэтому в отдельном try.
+  try { pushToAirtable(tree); } catch (e) { Logger.log('Airtable: ошибка — ' + e); }
 
   Logger.log('Файл ' + periodKey + ' обновлён: ' + stamp + ' (' + cur + ').');
 }
@@ -412,6 +425,122 @@ function wallMinutes(s) {
   var m = String(s).match(/(\d{2})\.(\d{2})\.(\d{4})\D+(\d{2}):(\d{2})/);
   if (!m) { return null; }
   return Date.UTC(+m[3], +m[2] - 1, +m[1], +m[4], +m[5]) / 60000;
+}
+
+// ── Airtable (живая сводка для CRM команды) ─────────────────────────────────────
+// Отправляет в Airtable итог по аккаунту и все активные кампании, ОБНОВЛЯЯ записи
+// (upsert по полю «ID»), а не плодя новые. Кампании, пропавшие из выгрузки, помечает
+// статусом «Неактивна». Если токен/база не заданы (плейсхолдеры) — тихо пропускает.
+function pushToAirtable(tree) {
+  if (!airtableEnabled()) {
+    Logger.log('Airtable выключен (не заданы токен/база) — пропускаю.');
+    return;
+  }
+  var iso = new Date().toISOString(); // Airtable хранит время в UTC и показывает в поясе пользователя
+
+  var records = [totalFields(tree.totals, iso)];
+  var seen = { 'ACCOUNT': true };
+  tree.order.forEach(function (cid) {
+    records.push(campaignFields(cid, tree.campaigns[cid], iso));
+    seen[String(cid)] = true;
+  });
+
+  airtableUpsert(records);
+  airtableMarkMissing(seen);
+  Logger.log('Airtable обновлён: ' + records.length + ' записей.');
+}
+
+function airtableEnabled() {
+  return AIRTABLE_TOKEN.indexOf('PASTE_') !== 0 && AIRTABLE_BASE_ID.indexOf('PASTE_') !== 0;
+}
+
+// Поля одной кампании. Порядок метрик — из metricRow(): [imp,clicks,ctr,cpc,cost,conv,cr,cpa,value,roas].
+function campaignFields(cid, c, iso) {
+  var m = c.metrics;
+  return {
+    'ID': String(cid), 'Уровень': 'Кампания', 'Кампания': c.name, 'Статус': statusRu(c.status),
+    'Показы': m[0], 'Клики': m[1], 'CTR %': m[2], 'Ср. CPC': m[3], 'Расход': m[4],
+    'Конверсии': m[5], 'CR %': m[6], 'CPA': m[7], 'Ценность': m[8], 'ROAS': m[9],
+    'Обновлено': iso
+  };
+}
+
+// Одна запись с итогом по аккаунту (производные считаем из сырых сумм totals).
+function totalFields(t, iso) {
+  var ctr  = t.imp > 0 ? t.clicks / t.imp * 100 : 0;
+  var cpc  = t.clicks > 0 ? t.cost / t.clicks : 0;
+  var cr   = t.clicks > 0 ? t.conv / t.clicks * 100 : 0;
+  var cpa  = t.conv > 0 ? t.cost / t.conv : 0;
+  var roas = t.cost > 0 ? t.value / t.cost : 0;
+  return {
+    'ID': 'ACCOUNT', 'Уровень': 'Итого', 'Кампания': 'ИТОГО ПО АККАУНТУ', 'Статус': 'Активна',
+    'Показы': t.imp, 'Клики': t.clicks, 'CTR %': r2(ctr), 'Ср. CPC': r2(cpc), 'Расход': r2(t.cost),
+    'Конверсии': r2(t.conv), 'CR %': r2(cr), 'CPA': r2(cpa), 'Ценность': r2(t.value), 'ROAS': r2(roas),
+    'Обновлено': iso
+  };
+}
+
+// Создаёт/обновляет записи пачками по 10 (лимит Airtable на запрос).
+function airtableUpsert(records) {
+  var url = airtableUrl();
+  for (var i = 0; i < records.length; i += 10) {
+    var batch = records.slice(i, i + 10).map(function (f) { return { fields: f }; });
+    airtableFetch('patch', url, { performUpsert: { fieldsToMergeOn: ['ID'] }, records: batch, typecast: true });
+    Utilities.sleep(250); // держимся в пределах лимита Airtable (~5 запросов/сек)
+  }
+}
+
+// Кампании, которых нет в свежей выгрузке, помечаем «Неактивна» (не удаляем).
+function airtableMarkMissing(seenIds) {
+  var stale = [];
+  airtableList().forEach(function (rec) {
+    var f = rec.fields || {};
+    if (f['Уровень'] === 'Кампания' && !seenIds[String(f['ID'])] && f['Статус'] !== 'Неактивна') {
+      stale.push({ id: rec.id, fields: { 'Статус': 'Неактивна' } });
+    }
+  });
+  var url = airtableUrl();
+  for (var i = 0; i < stale.length; i += 10) {
+    airtableFetch('patch', url, { records: stale.slice(i, i + 10), typecast: true });
+    Utilities.sleep(250);
+  }
+  if (stale.length) { Logger.log('Airtable: помечено неактивными ' + stale.length + ' кампаний.'); }
+}
+
+// Читает все записи таблицы (постранично по 100).
+function airtableList() {
+  var out = [];
+  var offset = null;
+  do {
+    var url = airtableUrl() + '?pageSize=100' + (offset ? '&offset=' + encodeURIComponent(offset) : '');
+    var data = airtableFetch('get', url, null);
+    if (!data) { break; }
+    (data.records || []).forEach(function (r) { out.push(r); });
+    offset = data.offset;
+  } while (offset);
+  return out;
+}
+
+function airtableUrl() {
+  return 'https://api.airtable.com/v0/' + AIRTABLE_BASE_ID + '/' + encodeURIComponent(AIRTABLE_TABLE);
+}
+
+// Запрос к Airtable. Ошибки логируем и возвращаем null (не валим скрипт).
+function airtableFetch(method, url, payload) {
+  var options = {
+    method: method, contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + AIRTABLE_TOKEN },
+    muteHttpExceptions: true
+  };
+  if (payload) { options.payload = JSON.stringify(payload); }
+  var res = UrlFetchApp.fetch(url, options);
+  var code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    Logger.log('Airtable ' + method.toUpperCase() + ' ' + code + ': ' + res.getContentText());
+    return null;
+  }
+  var text = res.getContentText();
+  return text ? JSON.parse(text) : {};
 }
 
 // ── Метрики ───────────────────────────────────────────────────────────────────
