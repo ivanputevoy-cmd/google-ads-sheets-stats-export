@@ -1,0 +1,10 @@
+# Выгрузки данных рекламного аккаунта — не для репозитория
+google_ads_audit_exports/
+
+# macOS
+.DS_Store
+
+# Редакторы
+.vscode/
+.idea/
+*.swp
